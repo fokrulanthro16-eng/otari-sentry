@@ -1,22 +1,20 @@
-# Otari-Sentry
+<div align="center">
 
-<p align="center"><img src="https://raw.githubusercontent.com/fokrulanthro16-eng/otari-sentry/feat/otari-gateway/assets/banner.svg" alt="Otari-Sentry Banner" width="100%" /></p>
+# 🛡️ OTARI-SENTRY
+### Enterprise AI Security Gateway & Sub-Millisecond Telemetry Control Plane
+**"Rules Engine Decides, AI Explains"**
 
-<p align="center">
-  <strong>Tier-1 Enterprise AI Security Gateway, Sub-Millisecond In-Memory Semantic Cache, and Deterministic Policy Firewall for Mozilla Otari Hosted AI Gateway.</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/fokrulanthro16-eng/otari-sentry/actions"><img src="https://github.com/fokrulanthro16-eng/otari-sentry/actions/workflows/ci.yml/badge.svg" alt="CI Test Suite"></a>
-  <a href="https://otari.ai/"><img src="https://img.shields.io/badge/Gateway-Mozilla%20Otari-FF7139.svg" alt="Mozilla Otari"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.14-3776AB.svg" alt="Python 3.11+"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Airlock%20Scan-%3C%200.05ms-brightgreen.svg" alt="Airlock Scan">
-  <img src="https://img.shields.io/badge/Zero--Token%20Rejection-100%25-emerald.svg" alt="Zero-Token Drops">
-  <img src="https://img.shields.io/badge/Cache%20Hit%20SLA-0.005ms-purple.svg" alt="Cache Hit SLA">
-</p>
+[![CI Test Suite](https://img.shields.io/badge/CI%20Test%20Suite-passing-brightgreen?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
+[![Gateway](https://img.shields.io/badge/Gateway-Mozilla%20Otari-orange?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
+[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.14-blue?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![Airlock Scan](https://img.shields.io/badge/Airlock%20Scan-%3C0.05ms-brightgreen?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
+[![Zero-Token Rejection](https://img.shields.io/badge/Zero--Token%20Rejection-100%25-brightgreen?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
+[![Cache Hit SLA](https://img.shields.io/badge/Cache%20Hit%20SLA-0.005ms-purple?style=flat-square)](https://github.com/fokrulanthro16-eng/otari-sentry)
 
 ---
+
+</div>
 
 ## 🏛️ Core Philosophy: "Rules Engine Decides, AI Explains"
 
