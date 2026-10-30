@@ -1,7 +1,7 @@
 # Otari-Sentry
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/fokrulanthro16-eng/otari-sentry/feat/otari-gateway/templates/logo.png" alt="Otari-Sentry Banner" width="120" onerror="this.style.display='none'"/>
+  <img src="./assets/banner.svg" alt="Otari-Sentry Banner" width="100%"/>
 </p>
 
 <p align="center">
