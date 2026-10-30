@@ -1,8 +1,6 @@
 # Otari-Sentry
 
-<p align="center">
-  <img src="./assets/banner.svg" alt="Otari-Sentry Banner" width="100%"/>
-</p>
+<p align="center"><img src="https://raw.githubusercontent.com/fokrulanthro16-eng/otari-sentry/feat/otari-gateway/assets/banner.svg" alt="Otari-Sentry Banner" width="100%" /></p>
 
 <p align="center">
   <strong>Tier-1 Enterprise AI Security Gateway, Sub-Millisecond In-Memory Semantic Cache, and Deterministic Policy Firewall for Mozilla Otari Hosted AI Gateway.</strong>
