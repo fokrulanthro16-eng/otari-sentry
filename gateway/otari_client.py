@@ -19,6 +19,19 @@ from openai import (
 logger = logging.getLogger("otari-sentry.gateway.client")
 
 
+def normalize_otari_model(model_name: str) -> str:
+    """
+    Standardize model strings to match Mozilla Otari catalog identifiers.
+    E.g. meta-llama/llama-3.3-70b-instruct -> meta/llama-3.3-70b-instruct
+    """
+    if not model_name:
+        return "alibaba/qwen-3.5-35b-a3b"
+    m = model_name.strip()
+    if m.startswith("meta-llama/"):
+        return m.replace("meta-llama/", "meta/", 1)
+    return m
+
+
 class OtariGatewayError(Exception):
     """Base exception for all Otari Gateway interaction failures."""
 
@@ -64,22 +77,42 @@ class OtariClient:
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        timeout: float = 12.0,
+        timeout: float = 30.0,
         extra_headers: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> Any:
         """
         Execute chat completion against Mozilla Otari with strict per-request SLA timeout.
+        Standardizes model identifier and sanitizes message payloads.
         """
+        target_model = normalize_otari_model(model)
+
         headers = {
             "User-Agent": "otari-sentry/1.0.0",
         }
         if extra_headers:
             headers.update(extra_headers)
 
+        # Sanitize messages to strictly comply with OpenAI/Otari chat schema
+        sanitized_messages: List[Dict[str, str]] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Flatten multi-part content if needed
+                text_parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(text_parts) if text_parts else str(content)
+            elif content is None:
+                content = ""
+            sanitized_messages.append({"role": str(role), "content": str(content)})
+
         req_kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
+            "model": target_model,
+            "messages": sanitized_messages,
             "temperature": temperature,
             "timeout": timeout,
             "extra_headers": headers,
@@ -94,9 +127,10 @@ class OtariClient:
 
         except APITimeoutError as exc:
             logger.warning(
-                "Otari gateway request timed out after %.2fs for model '%s': %s",
+                "Otari gateway request timed out after %.2fs for model '%s' (target: '%s'): %s",
                 timeout,
                 model,
+                target_model,
                 exc,
             )
             raise OtariGatewayError(
@@ -133,17 +167,19 @@ class OtariClient:
             ) from exc
 
         except APIStatusError as exc:
-            is_transient = exc.status_code in {408, 429, 500, 502, 503, 504}
+            # 400 (unsupported model, cold start, bad parameter) and 408/429/5xx are eligible for failover
+            is_failover_eligible = exc.status_code in {400, 404, 408, 429, 500, 502, 503, 504}
             logger.warning(
-                "Otari gateway returned HTTP %d for model '%s': %s",
+                "Otari gateway returned HTTP %d for model '%s' (target: '%s'): %s",
                 exc.status_code,
                 model,
-                exc,
+                target_model,
+                exc.message,
             )
             raise OtariGatewayError(
                 message=f"Otari gateway error HTTP {exc.status_code}: {exc.message}",
                 status_code=exc.status_code,
-                is_transient=is_transient,
+                is_transient=is_failover_eligible,
                 original_error=exc,
             ) from exc
 
@@ -165,7 +201,7 @@ class OtariClient:
             raise OtariGatewayError(
                 message=f"Unexpected Otari gateway client error: {str(exc)}",
                 status_code=500,
-                is_transient=False,
+                is_transient=True,
                 original_error=exc,
             ) from exc
 

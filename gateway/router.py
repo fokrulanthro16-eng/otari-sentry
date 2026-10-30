@@ -310,13 +310,10 @@ class SentryRouter:
                 total_tokens=tt,
             )
 
-        except OtariGatewayError as exc:
-            # Check if error is transient (timeout, 429, 5xx, connection error)
-            if not exc.is_transient:
-                # Client error (e.g. 400 Bad Request) - do not trip circuit or retry
-                raise exc
-
-            failover_reason = f"Primary model failure ({exc.status_code}): {exc.message}"
+        except Exception as exc:
+            # Catch 504/timeout, 400 bad request, 429 quota, 5xx or connection failures from primary
+            status_code = getattr(exc, "status_code", 504 if "timeout" in str(exc).lower() else 500)
+            failover_reason = f"Primary model failure ({status_code}): {str(exc)}"
             logger.warning(
                 "[Trace %s] Primary model '%s' failed: %s. Initiating auto-failover to '%s'",
                 trace_id,

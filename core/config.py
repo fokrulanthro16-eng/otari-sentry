@@ -68,11 +68,11 @@ class Settings(BaseSettings):
 
     # SLA Timeouts & Retry Limits
     PRIMARY_TIMEOUT_SECONDS: float = Field(
-        default=12.0,
+        default=30.0,
         description="Strict SLA timeout for primary model execution",
     )
     FALLBACK_TIMEOUT_SECONDS: float = Field(
-        default=15.0,
+        default=35.0,
         description="Timeout for secondary fallback model execution",
     )
     MAX_RETRIES: int = Field(

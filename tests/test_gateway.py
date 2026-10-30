@@ -23,7 +23,7 @@ from core.telemetry import (
     parse_baggage,
     parse_traceparent,
 )
-from gateway.otari_client import OtariClient, OtariGatewayError
+from gateway.otari_client import OtariClient, OtariGatewayError, normalize_otari_model
 from gateway.router import CircuitBreaker, CircuitState, SentryRouter
 from main import app, get_app_airlock, get_app_router, get_app_telemetry
 
@@ -356,6 +356,45 @@ class TestRouterAndFallback:
             assert res.status_code == 200
             assert res.headers["X-Otari-Model-Served"] == "meta-llama/llama-3.3-70b-instruct"
             assert res.headers["X-Otari-Failover"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_primary_400_auto_failover(self, client: TestClient):
+        """When primary model returns HTTP 400, cleanly auto-failover to fallback model."""
+        router: SentryRouter = get_app_router(app)
+        fallback_response = {
+            "id": "chatcmpl-llama-400-failover",
+            "object": "chat.completion",
+            "model": "meta-llama/llama-3.3-70b-instruct",
+            "choices": [{"message": {"role": "assistant", "content": "Recovered from 400."}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+
+        async def mock_create_call(*args, **kwargs):
+            if kwargs.get("model") == "alibaba/qwen-3.5-35b-a3b":
+                raise OtariGatewayError(
+                    message="Unknown model or cold-start invalid request",
+                    status_code=400,
+                    is_transient=True,
+                )
+            return fallback_response
+
+        with patch.object(
+            router.client,
+            "create_chat_completion",
+            side_effect=mock_create_call,
+        ):
+            res = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "Testing 400 failover."}]},
+            )
+            assert res.status_code == 200
+            assert res.headers["X-Otari-Model-Served"] == "meta-llama/llama-3.3-70b-instruct"
+            assert res.headers["X-Otari-Failover"] == "true"
+
+    def test_normalize_otari_model_names(self):
+        """Verify model string normalization mapping for Mozilla Otari catalog."""
+        assert normalize_otari_model("meta-llama/llama-3.3-70b-instruct") == "meta/llama-3.3-70b-instruct"
+        assert normalize_otari_model("alibaba/qwen-3.5-35b-a3b") == "alibaba/qwen-3.5-35b-a3b"
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_trips_to_open_after_threshold(self, client: TestClient):
