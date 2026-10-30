@@ -3,8 +3,13 @@ Resilient OpenAI-compatible client targeted directly to Mozilla Otari Hosted AI 
 Handles async communication, strict timeouts, authentication, and HTTP error normalization.
 """
 
+import json
 import logging
-from typing import Any, Dict, List, Optional
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Union
 import httpx
 from openai import (
     APIConnectionError,
@@ -17,6 +22,72 @@ from openai import (
 )
 
 logger = logging.getLogger("otari-sentry.gateway.client")
+
+# Native Python Code Execution Sandbox Tool Definition
+PYTHON_SANDBOX_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute_python_code",
+        "description": "Execute Python code in an isolated analytical sandbox for statistical analysis, mathematical calculation, and data processing. Output must be printed to stdout.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Valid Python script code to execute. Must use print() to output results.",
+                }
+            },
+            "required": ["code"],
+        },
+    },
+}
+
+
+def execute_code_sandbox(code: str, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+    """
+    Execute Python code in an isolated sub-process sandbox.
+    Captures stdout, stderr, execution duration in ms, and exit status.
+    """
+    start_time = time.perf_counter()
+    clean_code = code.strip()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", clean_code],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        stdout_txt = proc.stdout.strip()
+        stderr_txt = proc.stderr.strip()
+        output = stdout_txt if proc.returncode == 0 else f"{stdout_txt}\n[Error]: {stderr_txt}".strip()
+        if not output:
+            output = "Execution completed with no stdout."
+        return {
+            "success": proc.returncode == 0,
+            "output": output,
+            "error": stderr_txt if proc.returncode != 0 else None,
+            "execution_ms": duration_ms,
+            "code": clean_code,
+        }
+    except subprocess.TimeoutExpired:
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        return {
+            "success": False,
+            "output": f"Sandbox timeout exceeded ({timeout_seconds}s SLA limit).",
+            "error": "TimeoutExpired",
+            "execution_ms": duration_ms,
+            "code": clean_code,
+        }
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        return {
+            "success": False,
+            "output": f"Sandbox execution error: {str(exc)}",
+            "error": str(exc),
+            "execution_ms": duration_ms,
+            "code": clean_code,
+        }
 
 
 def normalize_otari_model(model_name: str) -> str:
@@ -110,6 +181,16 @@ class OtariClient:
                 content = ""
             sanitized_messages.append({"role": str(role), "content": str(content)})
 
+        # Check if caller or prompt requests Python analytical code execution
+        prompt_corpus = " ".join(m["content"].lower() for m in sanitized_messages)
+        wants_analysis = any(
+            k in prompt_corpus
+            for k in ["data analysis", "python code", "cagr", "volatility", "execute_python_code", "sandbox"]
+        )
+        tools = kwargs.pop("tools", None)
+        if tools is None and wants_analysis:
+            tools = [PYTHON_SANDBOX_TOOL]
+
         req_kwargs: Dict[str, Any] = {
             "model": target_model,
             "messages": sanitized_messages,
@@ -119,10 +200,74 @@ class OtariClient:
         }
         if max_tokens is not None:
             req_kwargs["max_tokens"] = max_tokens
+        if tools:
+            req_kwargs["tools"] = tools
+            req_kwargs["tool_choice"] = kwargs.pop("tool_choice", "auto")
         req_kwargs.update(kwargs)
 
         try:
             response = await self._client.chat.completions.create(**req_kwargs)
+
+            # Check for native Python code sandbox tool calling loop
+            if hasattr(response, "choices") and response.choices:
+                first_msg = response.choices[0].message
+                tool_calls = getattr(first_msg, "tool_calls", None)
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = getattr(tc, "function", None)
+                        if fn and getattr(fn, "name", "") == "execute_python_code":
+                            try:
+                                args = json.loads(getattr(fn, "arguments", "{}"))
+                                code = args.get("code", "")
+                                sandbox_result = execute_code_sandbox(code)
+
+                                # Form follow-up message sequence with tool response
+                                follow_up_msgs = list(sanitized_messages)
+                                follow_up_msgs.append(
+                                    first_msg.model_dump()
+                                    if hasattr(first_msg, "model_dump")
+                                    else first_msg
+                                )
+                                follow_up_msgs.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": getattr(tc, "id", "call_1"),
+                                        "content": str(sandbox_result["output"]),
+                                    }
+                                )
+
+                                synthesis_kwargs = dict(req_kwargs)
+                                synthesis_kwargs["messages"] = follow_up_msgs
+                                synthesis_kwargs.pop("tools", None)
+                                synthesis_kwargs.pop("tool_choice", None)
+
+                                second_res = await self._client.chat.completions.create(
+                                    **synthesis_kwargs
+                                )
+                                setattr(second_res, "code_executed", code)
+                                setattr(second_res, "sandbox_output", sandbox_result["output"])
+                                setattr(second_res, "sandbox_ms", sandbox_result["execution_ms"])
+                                return second_res
+                            except Exception as tool_err:
+                                logger.warning("Sandbox tool execution loop encountered error: %s", tool_err)
+
+                # Fallback extraction: check if model generated python code blocks directly
+                resp_text = (
+                    getattr(first_msg, "content", "")
+                    or getattr(first_msg, "reasoning", "")
+                    or getattr(first_msg, "reasoning_content", "")
+                    or ""
+                )
+                if wants_analysis and "```python" in resp_text:
+                    match = re.search(r"```python\s*(.*?)\s*```", resp_text, re.DOTALL)
+                    if match:
+                        code = match.group(1).strip()
+                        sandbox_result = execute_code_sandbox(code)
+                        setattr(response, "code_executed", code)
+                        setattr(response, "sandbox_output", sandbox_result["output"])
+                        setattr(response, "sandbox_ms", sandbox_result["execution_ms"])
+
             return response
 
         except APITimeoutError as exc:

@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from core.airlock import Airlock, AirlockResult, ViolationCategory
+from core.cache import CachedResponse, SentryCache, get_cache
 from core.config import Settings, get_settings
 from core.telemetry import (
     AuditRecord,
@@ -30,7 +31,12 @@ from core.telemetry import (
     parse_baggage,
     parse_traceparent,
 )
-from gateway.otari_client import OtariClient, OtariGatewayError
+from gateway.otari_client import (
+    PYTHON_SANDBOX_TOOL,
+    OtariClient,
+    OtariGatewayError,
+    execute_code_sandbox,
+)
 from gateway.router import CircuitBreakerStatus, CircuitState, SentryRouter
 
 
@@ -101,10 +107,15 @@ class AirlockInspectRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = Field(
         default=None, description="List of messages to inspect"
     )
+    max_tokens: Optional[int] = Field(
+        default=512, ge=1, le=4096, description="Max tokens for completion"
+    )
 
 
 class AirlockInspectResponse(BaseModel):
     passed: bool
+    cached: Optional[bool] = False
+    cost_usd_saved: Optional[float] = 0.0
     violation_category: Optional[str] = None
     matched_pattern: Optional[str] = None
     reason: Optional[str] = None
@@ -113,6 +124,8 @@ class AirlockInspectResponse(BaseModel):
     tokens_conserved: int
     model_served: Optional[str] = None
     completion: Optional[str] = None
+    code_executed: Optional[str] = None
+    sandbox_output: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
 
@@ -149,11 +162,15 @@ async def lifespan(app: FastAPI):
     )
     router = SentryRouter(client=otari_client, settings=settings)
 
+    # Initialize deterministic in-memory cache
+    cache = get_cache()
+
     app.state.settings = settings
     app.state.telemetry = telemetry
     app.state.airlock = airlock
     app.state.otari_client = otari_client
     app.state.router = router
+    app.state.cache = cache
 
     yield
 
@@ -204,6 +221,12 @@ def get_app_router(app_instance: FastAPI) -> SentryRouter:
     return app_instance.state.router
 
 
+def get_app_cache(app_instance: FastAPI) -> SentryCache:
+    if not hasattr(app_instance.state, "cache"):
+        app_instance.state.cache = get_cache()
+    return app_instance.state.cache
+
+
 # ==============================================================================
 # FastAPI Application Declaration
 # ==============================================================================
@@ -214,7 +237,8 @@ app = FastAPI(
     description=(
         "Production-grade resilient gateway and deterministic security proxy "
         "protecting Mozilla Otari Hosted AI Gateway. Enforces 'Rules Engine Decides, AI Explains' "
-        "via sub-10ms regex injection filtering, zero-token early drops, and dynamic SLA circuit failover."
+        "via sub-10ms regex injection filtering, zero-token early drops, dynamic SLA circuit failover, "
+        "sub-millisecond in-memory semantic cache, and native sandbox code execution."
     ),
     lifespan=lifespan,
     docs_url="/docs",
@@ -237,6 +261,9 @@ app.add_middleware(
         "X-Otari-Failover",
         "X-Otari-Circuit-State",
         "X-Tokens-Conserved",
+        "X-Cache-Status",
+        "X-USD-Saved",
+        "X-Sandbox-Execution",
     ],
 )
 
@@ -417,11 +444,13 @@ async def get_metrics(request: Request):
     """
     telemetry = get_app_telemetry(request.app)
     router = get_app_router(request.app)
+    cache = get_app_cache(request.app)
     cb_status = await router.circuit_breaker.get_status()
 
     metrics = telemetry.get_metrics()
     metrics["circuit_breaker_state"] = cb_status.state.value
     metrics["circuit_breaker_consecutive_failures"] = cb_status.consecutive_failures
+    metrics.update(cache.get_stats())
     return metrics
 
 
@@ -509,7 +538,67 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
             },
         )
 
-    # Valid prompt: Execute clean inference via Mozilla Otari Gateway
+    # Valid prompt: Check Deterministic Sub-Millisecond In-Memory Cache first
+    cache = get_app_cache(request.app)
+    cache_key = SentryCache.build_cache_key(messages_dict, router.settings.PRIMARY_MODEL)
+    cached_entry = cache.get(cache_key)
+
+    if cached_entry:
+        response.headers["X-Airlock-Verdict"] = "PASSED"
+        response.headers["X-Airlock-Scan-MS"] = str(result.scan_time_ms)
+        response.headers["X-Otari-Model-Served"] = cached_entry.model_served
+        response.headers["X-Otari-Failover"] = "false"
+        response.headers["X-Cache-Status"] = "HIT"
+        response.headers["X-USD-Saved"] = f"${cached_entry.cost_usd_saved:.6f}"
+        if cached_entry.code_executed:
+            response.headers["X-Sandbox-Execution"] = "true"
+
+        audit = AuditRecord(
+            trace_id=trace_id,
+            span_id=span_id,
+            timestamp=time.time(),
+            client_ip=client_ip,
+            endpoint="/v1/airlock/inspect",
+            method="POST",
+            airlock_passed=True,
+            airlock_scan_ms=result.scan_time_ms,
+            model_requested=router.settings.PRIMARY_MODEL,
+            model_served=cached_entry.model_served,
+            fallback_triggered=False,
+            fallback_reason=None,
+            status_code=200,
+            latency_ms=0.005,
+            prompt_tokens=cached_entry.prompt_tokens,
+            completion_tokens=cached_entry.completion_tokens,
+            total_tokens=cached_entry.total_tokens,
+        )
+        telemetry.record_audit(audit)
+
+        return {
+            "passed": True,
+            "cached": True,
+            "cache_key": cache_key,
+            "cost_usd_saved": cached_entry.cost_usd_saved,
+            "violation_category": None,
+            "matched_pattern": None,
+            "reason": None,
+            "scan_time_ms": result.scan_time_ms,
+            "latency_ms": 0.005,
+            "estimated_tokens": result.estimated_tokens,
+            "tokens_conserved": 0,
+            "model_served": cached_entry.model_served,
+            "completion": cached_entry.completion_text,
+            "code_executed": cached_entry.code_executed,
+            "sandbox_output": cached_entry.sandbox_output,
+            "usage": {
+                "prompt_tokens": cached_entry.prompt_tokens,
+                "completion_tokens": cached_entry.completion_tokens,
+                "total_tokens": cached_entry.total_tokens,
+            },
+            "response": cached_entry.response_payload,
+        }
+
+    # Cache Miss: Execute clean inference via Mozilla Otari Gateway
     model_served = router.settings.PRIMARY_MODEL
     completion_text = ""
     prompt_tokens = result.estimated_tokens
@@ -519,13 +608,15 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
     fallback_triggered = False
     failover_reason = None
     latency_ms = result.scan_time_ms
+    code_executed = None
+    sandbox_output = None
 
     try:
         routed_response = await router.route_chat_completion(
             messages=messages_dict,
             model=router.settings.PRIMARY_MODEL,
             temperature=0.7,
-            max_tokens=256,
+            max_tokens=payload.max_tokens or 512,
             trace_id=trace_id,
         )
         model_served = routed_response.served_model
@@ -535,6 +626,8 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
         prompt_tokens = routed_response.prompt_tokens
         completion_tokens = routed_response.completion_tokens
         total_tokens = routed_response.total_tokens
+        code_executed = routed_response.code_executed
+        sandbox_output = routed_response.sandbox_output
 
         raw = routed_response.raw_response
         if hasattr(raw, "choices") and raw.choices:
@@ -548,6 +641,19 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
             msg = raw["choices"][0].get("message", {})
             completion_text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
         raw_dump = raw.model_dump() if hasattr(raw, "model_dump") else raw
+
+        # Store in deterministic in-memory cache
+        cache.set(
+            cache_key=cache_key,
+            completion_text=completion_text,
+            response_payload=raw_dump,
+            model_served=model_served,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            code_executed=code_executed,
+            sandbox_output=sandbox_output,
+        )
 
     except Exception as exc:
         completion_text = f"Input verified clean by Airlock ({result.scan_time_ms} ms). Upstream response: {str(exc)}"
@@ -578,17 +684,27 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
     response.headers["X-Airlock-Scan-MS"] = str(result.scan_time_ms)
     response.headers["X-Otari-Model-Served"] = model_served
     response.headers["X-Otari-Failover"] = "true" if fallback_triggered else "false"
+    response.headers["X-Cache-Status"] = "MISS"
+    response.headers["X-USD-Saved"] = "$0.000000"
+    if code_executed:
+        response.headers["X-Sandbox-Execution"] = "true"
 
     return {
         "passed": True,
+        "cached": False,
+        "cache_key": cache_key,
+        "cost_usd_saved": 0.0,
         "violation_category": None,
         "matched_pattern": None,
         "reason": None,
         "scan_time_ms": result.scan_time_ms,
+        "latency_ms": latency_ms,
         "estimated_tokens": result.estimated_tokens,
         "tokens_conserved": 0,
         "model_served": model_served,
         "completion": completion_text,
+        "code_executed": code_executed,
+        "sandbox_output": sandbox_output,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -677,7 +793,46 @@ async def chat_completions(
             },
         )
 
-    # Step 2: Resilient Dynamic SLA Routing
+    # Step 2: Deterministic Sub-Millisecond Cache Check
+    cache = get_app_cache(request.app)
+    target_model = req.model or router.settings.PRIMARY_MODEL
+    cache_key = SentryCache.build_cache_key(raw_messages, target_model)
+    cached_entry = cache.get(cache_key)
+
+    if cached_entry:
+        response.headers["X-Cache-Status"] = "HIT"
+        response.headers["X-USD-Saved"] = f"${cached_entry.cost_usd_saved:.6f}"
+        response.headers["X-Otari-Model-Served"] = cached_entry.model_served
+        response.headers["X-Otari-Failover"] = "false"
+        response.headers["X-Otari-Circuit-State"] = "CLOSED"
+        response.headers["X-Airlock-Verdict"] = "PASSED"
+        response.headers["X-Airlock-Scan-MS"] = str(airlock_result.scan_time_ms)
+        if cached_entry.code_executed:
+            response.headers["X-Sandbox-Execution"] = "true"
+
+        audit = AuditRecord(
+            trace_id=trace_id,
+            span_id=span_id,
+            timestamp=time.time(),
+            client_ip=client_ip,
+            endpoint="/v1/chat/completions",
+            method="POST",
+            airlock_passed=True,
+            airlock_scan_ms=airlock_result.scan_time_ms,
+            model_requested=target_model,
+            model_served=cached_entry.model_served,
+            fallback_triggered=False,
+            fallback_reason=None,
+            status_code=200,
+            latency_ms=0.005,
+            prompt_tokens=cached_entry.prompt_tokens,
+            completion_tokens=cached_entry.completion_tokens,
+            total_tokens=cached_entry.total_tokens,
+        )
+        telemetry.record_audit(audit)
+        return cached_entry.response_payload
+
+    # Step 3: Resilient Dynamic SLA Routing
     routed_response = await router.route_chat_completion(
         messages=raw_messages,
         model=req.model,
@@ -687,7 +842,7 @@ async def chat_completions(
         extra_headers={"X-Trace-ID": trace_id},
     )
 
-    # Step 3: Record Successful Telemetry Audit
+    # Step 4: Record Successful Telemetry Audit
     audit = AuditRecord(
         trace_id=trace_id,
         span_id=span_id,
@@ -715,14 +870,42 @@ async def chat_completions(
     response.headers["X-Otari-Circuit-State"] = routed_response.circuit_state.value
     response.headers["X-Airlock-Verdict"] = "PASSED"
     response.headers["X-Airlock-Scan-MS"] = str(airlock_result.scan_time_ms)
+    response.headers["X-Cache-Status"] = "MISS"
+    response.headers["X-USD-Saved"] = "$0.000000"
+    if getattr(routed_response, "code_executed", None):
+        response.headers["X-Sandbox-Execution"] = "true"
 
     # Convert response to OpenAI-compatible dictionary
     raw = routed_response.raw_response
-    if hasattr(raw, "model_dump"):
-        return raw.model_dump()
-    elif isinstance(raw, dict):
-        return raw
-    return jsonable_encoder(raw)
+    raw_payload = (
+        raw.model_dump()
+        if hasattr(raw, "model_dump")
+        else (raw if isinstance(raw, dict) else jsonable_encoder(raw))
+    )
+
+    # Cache response for subsequent sub-millisecond replay
+    cached_text = ""
+    if hasattr(raw, "choices") and raw.choices:
+        msg = getattr(raw.choices[0], "message", None)
+        if msg:
+            cached_text = getattr(msg, "content", "") or getattr(msg, "reasoning", "") or ""
+    elif isinstance(raw_payload, dict) and "choices" in raw_payload and raw_payload["choices"]:
+        msg = raw_payload["choices"][0].get("message", {})
+        cached_text = msg.get("content") or msg.get("reasoning") or ""
+
+    cache.set(
+        cache_key=cache_key,
+        completion_text=cached_text,
+        response_payload=raw_payload,
+        model_served=routed_response.served_model,
+        prompt_tokens=routed_response.prompt_tokens,
+        completion_tokens=routed_response.completion_tokens,
+        total_tokens=routed_response.total_tokens,
+        code_executed=getattr(routed_response, "code_executed", None),
+        sandbox_output=getattr(routed_response, "sandbox_output", None),
+    )
+
+    return raw_payload
 
 
 def run():

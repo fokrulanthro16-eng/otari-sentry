@@ -175,6 +175,8 @@ class RoutedCompletionResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    code_executed: Optional[str] = None
+    sandbox_output: Optional[str] = None
 
 
 class SentryRouter:
@@ -275,6 +277,8 @@ class SentryRouter:
                 prompt_tokens=pt,
                 completion_tokens=ct,
                 total_tokens=tt,
+                code_executed=getattr(fallback_res, "code_executed", None),
+                sandbox_output=getattr(fallback_res, "sandbox_output", None),
             )
 
         # Attempt primary route with 12s SLA timeout
@@ -308,6 +312,8 @@ class SentryRouter:
                 prompt_tokens=pt,
                 completion_tokens=ct,
                 total_tokens=tt,
+                code_executed=getattr(primary_res, "code_executed", None),
+                sandbox_output=getattr(primary_res, "sandbox_output", None),
             )
 
         except Exception as exc:
@@ -347,6 +353,8 @@ class SentryRouter:
                     prompt_tokens=pt,
                     completion_tokens=ct,
                     total_tokens=tt,
+                    code_executed=getattr(fallback_res, "code_executed", None),
+                    sandbox_output=getattr(fallback_res, "sandbox_output", None),
                 )
 
             except Exception as fallback_exc:

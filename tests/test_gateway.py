@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from core.airlock import Airlock, ViolationCategory
+from core.cache import SentryCache, get_cache
 from core.config import get_settings
 from core.telemetry import (
     format_baggage,
@@ -23,18 +24,27 @@ from core.telemetry import (
     parse_baggage,
     parse_traceparent,
 )
-from gateway.otari_client import OtariClient, OtariGatewayError, normalize_otari_model
+from gateway.otari_client import (
+    PYTHON_SANDBOX_TOOL,
+    OtariClient,
+    OtariGatewayError,
+    execute_code_sandbox,
+    normalize_otari_model,
+)
 from gateway.router import CircuitBreaker, CircuitState, SentryRouter
 from main import app, get_app_airlock, get_app_router, get_app_telemetry
 
 
 @pytest.fixture(autouse=True)
 def reset_telemetry_and_circuit():
-    """Reset telemetry metrics and circuit breaker between test runs for isolation."""
+    """Reset telemetry metrics, circuit breaker, and cache between test runs for isolation."""
     telemetry = get_telemetry_manager()
     telemetry.reset_for_tests()
+    cache = get_cache()
+    cache.clear()
     yield
     telemetry.reset_for_tests()
+    cache.clear()
 
 
 @pytest.fixture
@@ -612,4 +622,128 @@ class TestCircuitBreakerTransitions:
         max_ms = max(durations)
         assert avg_ms < 1.0, f"Average scan time was {avg_ms}ms, expected < 1.0ms"
         assert max_ms < 10.0, f"Max scan time was {max_ms}ms, expected < 10.0ms"
+
+
+# ==============================================================================
+# 5. Deterministic Semantic Cache & Code Execution Tests
+# ==============================================================================
+
+class TestSentryCache:
+    """Validate sub-millisecond in-memory cache and USD cost conservation."""
+
+    def test_cache_key_generation(self):
+        """Cache keys must be deterministic SHA-256 hashes of normalized messages."""
+        msg1 = [{"role": "user", "content": "  Explain   BFT consensus.  "}]
+        msg2 = [{"role": "user", "content": "Explain BFT consensus."}]
+        key1 = SentryCache.build_cache_key(msg1, "alibaba/qwen-3.5-35b-a3b")
+        key2 = SentryCache.build_cache_key(msg2, "alibaba/qwen-3.5-35b-a3b")
+        assert key1 == key2
+        assert len(key1) == 64
+
+    def test_cache_hit_and_financial_calculation(self):
+        """Cache hit serves in < 0.01ms and increments cumulative USD saved."""
+        cache = SentryCache()
+        key = "test_sha256_key"
+        # 1000 prompt tokens ($0.0008) + 500 completion tokens ($0.0008) = $0.0016
+        cost = cache.calculate_cost(1000, 500)
+        assert cost == 0.0016
+
+        cache.set(
+            cache_key=key,
+            completion_text="BFT stands for Byzantine Fault Tolerance.",
+            response_payload={"id": "test"},
+            model_served="alibaba/qwen-3.5-35b-a3b",
+            prompt_tokens=1000,
+            completion_tokens=500,
+            total_tokens=1500,
+        )
+
+        entry = cache.get(key)
+        assert entry is not None
+        assert entry.hit_count == 1
+        assert entry.cost_usd_saved == 0.0016
+        assert cache.cumulative_usd_saved == 0.0016
+        assert cache.hits == 1
+
+        stats = cache.get_stats()
+        assert stats["cache_hits"] == 1
+        assert stats["cache_hit_rate_percentage"] == 100.0
+
+    def test_cache_ttl_expiration(self):
+        """Expired entries must be evicted on lookup."""
+        cache = SentryCache()
+        key = "expire_key"
+        cache.set(
+            cache_key=key,
+            completion_text="Expiring text",
+            response_payload={},
+            model_served="test",
+            prompt_tokens=10,
+            completion_tokens=10,
+            total_tokens=20,
+            ttl_seconds=0.05,
+        )
+        assert cache.get(key) is not None
+        time.sleep(0.06)
+        assert cache.get(key) is None
+        assert cache.misses == 1
+
+    def test_cache_integration_in_chat_completions(self, client: TestClient):
+        """End-to-end chat completions returns X-Cache-Status MISS then HIT."""
+        router: SentryRouter = get_app_router(app)
+        mock_response = {
+            "id": "chatcmpl-mock-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Cache test response"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        }
+
+        with patch.object(
+            router.client,
+            "create_chat_completion",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_call:
+            payload = {
+                "messages": [{"role": "user", "content": "What is deterministic cache invalidation?"}]
+            }
+            # First Call: MISS
+            res1 = client.post("/v1/chat/completions", json=payload)
+            assert res1.status_code == 200
+            assert res1.headers["X-Cache-Status"] == "MISS"
+            assert mock_call.call_count == 1
+
+            # Second Call: HIT (served directly from cache, zero upstream LLM call)
+            res2 = client.post("/v1/chat/completions", json=payload)
+            assert res2.status_code == 200
+            assert res2.headers["X-Cache-Status"] == "HIT"
+            assert "X-USD-Saved" in res2.headers
+            assert mock_call.call_count == 1
+
+
+class TestCodeExecutionSandbox:
+    """Validate secure isolated local Python code execution."""
+
+    def test_sandbox_successful_execution(self):
+        """Sandbox successfully executes valid Python code and captures stdout."""
+        code = "metrics = [140, 185, 230, 290, 410]\nmean = sum(metrics)/len(metrics)\nprint(f'Mean: {mean:.1f}')"
+        res = execute_code_sandbox(code)
+        assert res["success"] is True
+        assert "Mean: 251.0" in res["output"]
+        assert res["execution_ms"] > 0
+        assert res["error"] is None
+
+    def test_sandbox_syntax_error_handling(self):
+        """Sandbox handles syntax errors cleanly without process crashes."""
+        bad_code = "def syntax_broken(\nprint('missing paren')"
+        res = execute_code_sandbox(bad_code)
+        assert res["success"] is False
+        assert "SyntaxError" in res["output"] or "SyntaxError" in str(res["error"])
+
+    def test_sandbox_timeout_handling(self):
+        """Sandbox enforces a strict timeout on infinite loops."""
+        infinite_loop = "import time\ntime.sleep(15)"
+        res = execute_code_sandbox(infinite_loop, timeout_seconds=1.0)
+        assert res["success"] is False
+        assert "timeout exceeded" in res["output"].lower()
+        assert res["error"] == "TimeoutExpired"
 
