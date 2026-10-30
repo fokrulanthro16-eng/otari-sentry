@@ -7,6 +7,7 @@ and OpenTelemetry-compatible tracing for Mozilla Otari Hosted AI Gateway.
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import uvicorn
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from core.airlock import Airlock, AirlockResult, ViolationCategory
@@ -330,6 +331,30 @@ async def otari_gateway_exception_handler(request: Request, exc: OtariGatewayErr
 # API Endpoints
 # ==============================================================================
 
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+INDEX_HTML_PATH = TEMPLATES_DIR / "index.html"
+
+
+@app.get(
+    "/",
+    response_class=HTMLResponse,
+    tags=["Dashboard"],
+    summary="Otari-Sentry Interactive Dark-Mode Web Dashboard",
+)
+async def serve_dashboard():
+    """
+    Serve the high-contrast dark mode interactive Web UI dashboard.
+    """
+    if INDEX_HTML_PATH.exists():
+        return HTMLResponse(content=INDEX_HTML_PATH.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content="""<!DOCTYPE html><html><head><title>Otari-Sentry</title></head>
+        <body style='background:#0d1117;color:#fff;font-family:sans-serif;padding:2rem;'>
+        <h1>Otari-Sentry Gateway</h1><p>Dashboard template initializing...</p></body></html>""",
+        status_code=200,
+    )
+
+
 @app.get(
     "/healthz",
     tags=["System"],
@@ -485,27 +510,48 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
         )
 
     # Valid prompt: Execute clean inference via Mozilla Otari Gateway
-    routed_response = await router.route_chat_completion(
-        messages=messages_dict,
-        model=router.settings.PRIMARY_MODEL,
-        temperature=0.7,
-        max_tokens=256,
-        trace_id=trace_id,
-    )
-
-    # Extract completion text
-    raw = routed_response.raw_response
+    model_served = router.settings.PRIMARY_MODEL
     completion_text = ""
-    if hasattr(raw, "choices") and raw.choices:
-        c = raw.choices[0]
-        msg = getattr(c, "message", None)
-        if msg:
-            content = getattr(msg, "content", "")
-            reasoning = getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "")
-            completion_text = content or reasoning or ""
-    elif isinstance(raw, dict) and "choices" in raw and raw["choices"]:
-        msg = raw["choices"][0].get("message", {})
-        completion_text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+    prompt_tokens = result.estimated_tokens
+    completion_tokens = 0
+    total_tokens = prompt_tokens
+    raw_dump = None
+    fallback_triggered = False
+    failover_reason = None
+    latency_ms = result.scan_time_ms
+
+    try:
+        routed_response = await router.route_chat_completion(
+            messages=messages_dict,
+            model=router.settings.PRIMARY_MODEL,
+            temperature=0.7,
+            max_tokens=256,
+            trace_id=trace_id,
+        )
+        model_served = routed_response.served_model
+        fallback_triggered = routed_response.fallback_triggered
+        failover_reason = routed_response.failover_reason
+        latency_ms = routed_response.latency_ms
+        prompt_tokens = routed_response.prompt_tokens
+        completion_tokens = routed_response.completion_tokens
+        total_tokens = routed_response.total_tokens
+
+        raw = routed_response.raw_response
+        if hasattr(raw, "choices") and raw.choices:
+            c = raw.choices[0]
+            msg = getattr(c, "message", None)
+            if msg:
+                content = getattr(msg, "content", "")
+                reasoning = getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "")
+                completion_text = content or reasoning or ""
+        elif isinstance(raw, dict) and "choices" in raw and raw["choices"]:
+            msg = raw["choices"][0].get("message", {})
+            completion_text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+        raw_dump = raw.model_dump() if hasattr(raw, "model_dump") else raw
+
+    except Exception as exc:
+        completion_text = f"Input verified clean by Airlock ({result.scan_time_ms} ms). Upstream response: {str(exc)}"
+        raw_dump = {"info": "Upstream error or offline mode", "detail": str(exc)}
 
     audit = AuditRecord(
         trace_id=trace_id,
@@ -516,24 +562,23 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
         method="POST",
         airlock_passed=True,
         airlock_scan_ms=result.scan_time_ms,
-        model_requested=routed_response.requested_model,
-        model_served=routed_response.served_model,
-        fallback_triggered=routed_response.fallback_triggered,
-        fallback_reason=routed_response.failover_reason,
+        model_requested=router.settings.PRIMARY_MODEL,
+        model_served=model_served,
+        fallback_triggered=fallback_triggered,
+        fallback_reason=failover_reason,
         status_code=200,
-        latency_ms=routed_response.latency_ms,
-        prompt_tokens=routed_response.prompt_tokens,
-        completion_tokens=routed_response.completion_tokens,
-        total_tokens=routed_response.total_tokens,
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
     )
     telemetry.record_audit(audit)
 
     response.headers["X-Airlock-Verdict"] = "PASSED"
     response.headers["X-Airlock-Scan-MS"] = str(result.scan_time_ms)
-    response.headers["X-Otari-Model-Served"] = routed_response.served_model
-    response.headers["X-Otari-Failover"] = "true" if routed_response.fallback_triggered else "false"
+    response.headers["X-Otari-Model-Served"] = model_served
+    response.headers["X-Otari-Failover"] = "true" if fallback_triggered else "false"
 
-    raw_dump = raw.model_dump() if hasattr(raw, "model_dump") else raw
     return {
         "passed": True,
         "violation_category": None,
@@ -542,12 +587,12 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request, resp
         "scan_time_ms": result.scan_time_ms,
         "estimated_tokens": result.estimated_tokens,
         "tokens_conserved": 0,
-        "model_served": routed_response.served_model,
+        "model_served": model_served,
         "completion": completion_text,
         "usage": {
-            "prompt_tokens": routed_response.prompt_tokens,
-            "completion_tokens": routed_response.completion_tokens,
-            "total_tokens": routed_response.total_tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
         },
         "response": raw_dump,
     }

@@ -181,15 +181,34 @@ class TestAirlockSecurity:
 
     def test_airlock_direct_inspection_endpoint(self, client: TestClient):
         """Validate standalone /v1/airlock/inspect endpoint executes in sub-10ms."""
-        res = client.post(
-            "/v1/airlock/inspect",
-            json={"prompt": "Explain database normalization in PostgreSQL."},
-        )
+        router = get_app_router(app)
+        mock_res = {
+            "choices": [{"message": {"role": "assistant", "content": "Database normalization optimizes schemas."}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18}
+        }
+        with patch.object(
+            router.client,
+            "create_chat_completion",
+            new_callable=AsyncMock,
+            return_value=mock_res,
+        ):
+            res = client.post(
+                "/v1/airlock/inspect",
+                json={"prompt": "Explain database normalization in PostgreSQL."},
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["passed"] is True
+            assert data["scan_time_ms"] < 10.0
+            assert data["estimated_tokens"] > 0
+
+    def test_web_ui_dashboard_endpoint(self, client: TestClient):
+        """Root GET / returns HTTP 200 with interactive dark-mode dashboard."""
+        res = client.get("/")
         assert res.status_code == 200
-        data = res.json()
-        assert data["passed"] is True
-        assert data["scan_time_ms"] < 10.0
-        assert data["estimated_tokens"] > 0
+        assert "text/html" in res.headers.get("content-type", "")
+        assert "Otari-Sentry" in res.text
+        assert "Inject Jailbreak" in res.text
 
 
 # ==============================================================================
