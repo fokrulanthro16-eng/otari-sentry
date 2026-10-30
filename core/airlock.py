@@ -84,7 +84,15 @@ JAILBREAK_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(bypass|disable|ignore|strip|remove)\s+(all\s+)?(safety|ethical|content|policy|openai|anthropic|guardrails?)\s+(filters|rules|guardrails|policies|guidelines|protocols)\b",
+        r"\b(bypass|disable|ignore|strip|remove|circumvent)\s+(all\s+)?(safety|security|ethical|content|policy|openai|anthropic|guardrails?)\s+(filters|rules|guardrails|policies|guidelines|protocols)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(bypass|circumvent|override|disable)\s+(all\s+)?(security\s+guardrails?|security\s+filters?|safety\s+guardrails?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(base64_decode|b64decode|decode_base64|rot13|hex_decode)\b",
         re.IGNORECASE,
     ),
     re.compile(
