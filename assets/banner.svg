@@ -105,7 +105,7 @@
     <!-- Tagline -->
     <text x="2" y="188" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" 
           font-size="13" font-weight="600" fill="#94a3b8" letter-spacing="1">
-      &quot;Rules Engine Decides, AI Explains&quot; &bull; Sub-Millisecond Policy Firewall
+      &quot;Rules Engine Decides, AI Explains&quot; &#8226; Sub-Millisecond Policy Firewall
     </text>
 
     <!-- Feature Badges -->
