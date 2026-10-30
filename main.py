@@ -110,6 +110,12 @@ class AirlockInspectResponse(BaseModel):
     scan_time_ms: float
     estimated_tokens: int
     tokens_conserved: int
+    model_served: Optional[str] = None
+    completion: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
 
 
 # ==============================================================================
@@ -325,6 +331,12 @@ async def otari_gateway_exception_handler(request: Request, exc: OtariGatewayErr
 # ==============================================================================
 
 @app.get(
+    "/healthz",
+    tags=["System"],
+    summary="Health check probe",
+)
+@app.get("/v1/healthz", tags=["System"], include_in_schema=False)
+@app.get(
     "/v1/health",
     tags=["System"],
     summary="Health check & circuit breaker status",
@@ -390,16 +402,22 @@ async def get_metrics(request: Request):
 
 @app.post(
     "/v1/airlock/inspect",
-    response_model=AirlockInspectResponse,
     tags=["Security"],
-    summary="Sub-10ms deterministic Airlock inspection without routing to LLM",
+    summary="Sub-10ms deterministic Airlock inspection and inference proxy",
 )
-async def airlock_inspect(payload: AirlockInspectRequest, request: Request):
+async def airlock_inspect(payload: AirlockInspectRequest, request: Request, response: Response):
     """
     Deterministic audit tool to test inputs against the Airlock security policies.
-    Guaranteed sub-10ms response without invoking any LLM or consuming tokens.
+    Guaranteed sub-10ms response:
+    - If policy violation: Returns HTTP 403 Forbidden with 0 token leakage and sub-millisecond execution.
+    - If clean: Executes inference via Mozilla Otari gateway, returns completion, and logs token telemetry.
     """
     airlock = get_app_airlock(request.app)
+    router = get_app_router(request.app)
+    telemetry = get_app_telemetry(request.app)
+    trace_id = getattr(request.state, "trace_id", "unknown-trace")
+    span_id = getattr(request.state, "span_id", "unknown-span")
+    client_ip = request.client.host if request.client else None
 
     if payload.messages:
         messages_dict = [m.model_dump() for m in payload.messages]
@@ -412,15 +430,127 @@ async def airlock_inspect(payload: AirlockInspectRequest, request: Request):
         )
 
     result = airlock.inspect_messages(messages_dict)
-    return AirlockInspectResponse(
-        passed=result.passed,
-        violation_category=result.violation_category.value if result.violation_category else None,
-        matched_pattern=result.matched_pattern,
-        reason=result.reason,
-        scan_time_ms=result.scan_time_ms,
-        estimated_tokens=result.estimated_tokens,
-        tokens_conserved=result.tokens_conserved,
+
+    if not result.passed:
+        # Rules Engine Decides: Immediate deterministic rejection with ZERO token consumption
+        tokens_saved = result.tokens_conserved
+        violation_cat = result.violation_category.value if result.violation_category else "UNKNOWN"
+
+        audit = AuditRecord(
+            trace_id=trace_id,
+            span_id=span_id,
+            timestamp=time.time(),
+            client_ip=client_ip,
+            endpoint="/v1/airlock/inspect",
+            method="POST",
+            airlock_passed=False,
+            airlock_violation=violation_cat,
+            airlock_reason=result.reason,
+            airlock_scan_ms=result.scan_time_ms,
+            model_requested=router.settings.PRIMARY_MODEL,
+            model_served=None,
+            status_code=403,
+            latency_ms=result.scan_time_ms,
+            tokens_conserved=tokens_saved,
+        )
+        telemetry.record_audit(audit)
+
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            headers={
+                "X-Airlock-Verdict": "REJECTED",
+                "X-Airlock-Violation": violation_cat,
+                "X-Airlock-Scan-MS": str(result.scan_time_ms),
+                "X-Tokens-Conserved": str(tokens_saved),
+            },
+            content={
+                "error": {
+                    "message": f"Airlock Security Violation: {result.reason}",
+                    "type": "airlock_security_violation",
+                    "code": "forbidden_prompt",
+                    "violation_category": violation_cat,
+                    "matched_pattern": result.matched_pattern,
+                    "tokens_conserved": tokens_saved,
+                    "scan_time_ms": result.scan_time_ms,
+                    "trace_id": trace_id,
+                },
+                "passed": False,
+                "violation_category": violation_cat,
+                "matched_pattern": result.matched_pattern,
+                "reason": result.reason,
+                "scan_time_ms": result.scan_time_ms,
+                "estimated_tokens": result.estimated_tokens,
+                "tokens_conserved": tokens_saved,
+            },
+        )
+
+    # Valid prompt: Execute clean inference via Mozilla Otari Gateway
+    routed_response = await router.route_chat_completion(
+        messages=messages_dict,
+        model=router.settings.PRIMARY_MODEL,
+        temperature=0.7,
+        max_tokens=256,
+        trace_id=trace_id,
     )
+
+    # Extract completion text
+    raw = routed_response.raw_response
+    completion_text = ""
+    if hasattr(raw, "choices") and raw.choices:
+        c = raw.choices[0]
+        msg = getattr(c, "message", None)
+        if msg:
+            content = getattr(msg, "content", "")
+            reasoning = getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "")
+            completion_text = content or reasoning or ""
+    elif isinstance(raw, dict) and "choices" in raw and raw["choices"]:
+        msg = raw["choices"][0].get("message", {})
+        completion_text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+
+    audit = AuditRecord(
+        trace_id=trace_id,
+        span_id=span_id,
+        timestamp=time.time(),
+        client_ip=client_ip,
+        endpoint="/v1/airlock/inspect",
+        method="POST",
+        airlock_passed=True,
+        airlock_scan_ms=result.scan_time_ms,
+        model_requested=routed_response.requested_model,
+        model_served=routed_response.served_model,
+        fallback_triggered=routed_response.fallback_triggered,
+        fallback_reason=routed_response.failover_reason,
+        status_code=200,
+        latency_ms=routed_response.latency_ms,
+        prompt_tokens=routed_response.prompt_tokens,
+        completion_tokens=routed_response.completion_tokens,
+        total_tokens=routed_response.total_tokens,
+    )
+    telemetry.record_audit(audit)
+
+    response.headers["X-Airlock-Verdict"] = "PASSED"
+    response.headers["X-Airlock-Scan-MS"] = str(result.scan_time_ms)
+    response.headers["X-Otari-Model-Served"] = routed_response.served_model
+    response.headers["X-Otari-Failover"] = "true" if routed_response.fallback_triggered else "false"
+
+    raw_dump = raw.model_dump() if hasattr(raw, "model_dump") else raw
+    return {
+        "passed": True,
+        "violation_category": None,
+        "matched_pattern": None,
+        "reason": None,
+        "scan_time_ms": result.scan_time_ms,
+        "estimated_tokens": result.estimated_tokens,
+        "tokens_conserved": 0,
+        "model_served": routed_response.served_model,
+        "completion": completion_text,
+        "usage": {
+            "prompt_tokens": routed_response.prompt_tokens,
+            "completion_tokens": routed_response.completion_tokens,
+            "total_tokens": routed_response.total_tokens,
+        },
+        "response": raw_dump,
+    }
 
 
 @app.post(

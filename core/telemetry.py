@@ -240,6 +240,8 @@ class TelemetryManager:
 
             return {
                 "total_requests": total,
+                "admitted_requests": success,
+                "blocked_requests": blocked,
                 "successful_requests": success,
                 "airlock_blocked_requests": blocked,
                 "fallback_requests": fallback,
